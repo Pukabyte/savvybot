@@ -7,8 +7,9 @@ import numpy as np
 import requests
 from dotenv import load_dotenv
 from knowledge_base import update_knowledge_base, get_similar_documents
-from schedule_scraper import get_resolved_threads, scrape_resolved_threads
+from schedule_scraper import get_resolved_threads, scrape_resolved_threads, scrape_documentation, load_documents, save_documents, update_faiss_index
 from sentence_transformers import SentenceTransformer
+from documentation_scraper import scrape_documentation
 
 # Configure logging
 logging.basicConfig(
@@ -126,8 +127,31 @@ async def initialize_bot():
     """Initialize the bot and update knowledge base."""
     logging.info("Starting bot initialization")
     try:
-        # Only call scrape_resolved_threads once
+        documents = []
+        
+        # First scrape documentation if URLs are configured
+        doc_urls = os.getenv('DOCUMENTATION_URLS')
+        if doc_urls:
+            logging.info(f"Starting documentation scraping from URLs: {doc_urls}")
+            doc_urls_list = [url.strip() for url in doc_urls.split(',') if url.strip()]
+            if doc_urls_list:
+                doc_documents = await scrape_documentation(doc_urls_list)
+                if doc_documents:
+                    documents.extend(doc_documents)
+                    logging.info(f"Added {len(doc_documents)} documentation documents")
+        else:
+            logging.info("No documentation URLs configured, skipping documentation scraping")
+            
+        # Then scrape resolved threads
+        logging.info("Starting thread scraping")
         await scrape_resolved_threads(client)
+        
+        # Save and index all documents
+        if documents:
+            await save_documents(documents)
+            await update_faiss_index(documents)
+            logging.info(f"Completed initialization with {len(documents)} total documents")
+            
     except Exception as e:
         logging.error(f"Error during initialization: {e}")
 
@@ -219,5 +243,45 @@ async def process_resolved_thread(thread):
             
     except Exception as e:
         logging.error(f"Error processing resolved thread {thread.name}: {e}")
+
+async def handle_message(message):
+    """Handle incoming messages."""
+    try:
+        question = message.content
+        logging.info(f"Processing message from {message.author.name}: {question}")
+        
+        # Search for similar content
+        similar_docs = await get_similar_documents(question, top_k=1)
+        similar_content = similar_docs[0]['text'] if similar_docs else None
+        
+        # Create prompt for Ollama
+        prompt = f"""Based on this question and any related previous answer, provide a clear, direct response.
+
+Question: {question}
+
+{"Previous relevant information:" + similar_content if similar_content else ""}
+
+Respond directly to the question. Do not reference previous discussions or mention that this has been asked before. Provide a clear, actionable answer."""
+        
+        # Get Ollama's response
+        response = requests.post(
+            f"{os.getenv('OLLAMA_SERVER_URL')}/api/generate",
+            json={
+                "model": os.getenv('OLLAMA_MODEL', 'llama2'),
+                "prompt": prompt,
+                "system": "You are a helpful support assistant. Provide clear, direct answers without referencing previous discussions or mentioning that the question has been asked before.",
+                "stream": False
+            },
+            timeout=30
+        )
+        
+        response.raise_for_status()
+        answer = response.json().get('response', '')
+        
+        await message.channel.send(answer)
+        
+    except Exception as e:
+        logging.error(f"Error processing message: {e}")
+        await message.channel.send("I encountered an error while processing your question.")
 
 client.run(DISCORD_TOKEN)

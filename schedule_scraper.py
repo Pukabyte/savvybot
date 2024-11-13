@@ -12,9 +12,19 @@ load_dotenv()
 FORUM_CHANNEL_ID = int(os.getenv('FORUM_CHANNEL_ID'))
 
 async def get_resolved_threads(client):
-    """Get all resolved threads from the forum channel."""
+    """Get all threads with the resolved tag from the forum channel."""
     try:
-        channel_id = int(os.getenv('FORUM_CHANNEL_ID'))
+        # Check for required environment variables
+        channel_id = os.getenv('FORUM_CHANNEL_ID')
+        resolved_tag_id = os.getenv('RESOLVED_TAG_ID')
+        
+        if not channel_id or not resolved_tag_id:
+            logging.error("Missing required environment variables: FORUM_CHANNEL_ID or RESOLVED_TAG_ID")
+            return []
+            
+        channel_id = int(channel_id)
+        resolved_tag_id = int(resolved_tag_id)
+        
         channel = client.get_channel(channel_id)
         
         if not channel or not isinstance(channel, discord.ForumChannel):
@@ -24,23 +34,24 @@ async def get_resolved_threads(client):
         resolved_threads = []
         
         try:
-            # Get all active threads
+            # Get all threads from the forum
             active_threads = channel.threads
             for thread in active_threads:
-                if thread.name.upper().startswith('RESOLVED:'):
-                    logging.info(f"Processing active thread: {thread.name}")
+                # Check if the resolved tag is applied
+                if any(tag.id == resolved_tag_id for tag in thread.applied_tags):
+                    logging.info(f"Processing tagged thread: {thread.name}")
                     resolved_threads.append(thread)
                     
-            # Get archived threads - use async for directly
+            # Get archived threads
             async for thread in channel.archived_threads():
-                if thread.name.upper().startswith('RESOLVED:'):
-                    logging.info(f"Processing archived thread: {thread.name}")
+                if any(tag.id == resolved_tag_id for tag in thread.applied_tags):
+                    logging.info(f"Processing archived tagged thread: {thread.name}")
                     resolved_threads.append(thread)
                     
         except Exception as e:
             logging.error(f"Error getting threads: {e}")
                 
-        logging.info(f"Found {len(resolved_threads)} resolved threads")
+        logging.info(f"Found {len(resolved_threads)} threads with resolved tag")
         return resolved_threads
         
     except Exception as e:
@@ -76,14 +87,23 @@ async def scrape_resolved_threads(client):
         logging.info("Starting to scrape resolved threads")
         resolved_threads = await get_resolved_threads(client)
         
-        # Load existing documents
-        documents = await load_documents()
+        # Load existing documents or start with empty list
+        try:
+            documents = await load_documents()
+        except:
+            documents = []
+            
         updated = False
         
         # Process each thread
         for thread in resolved_threads:
             logging.info(f"Processing thread content for: {thread.name}")
             
+            # Skip if thread already exists in documents
+            if any(doc["source"] == f"Discord Thread: {thread.name}" for doc in documents):
+                logging.info(f"Thread already exists in documents: {thread.name}")
+                continue
+                
             # Fetch all messages in the thread
             messages = []
             async for message in thread.history(limit=None, oldest_first=True):
@@ -97,19 +117,19 @@ async def scrape_resolved_threads(client):
             # Create prompt for Ollama
             thread_content = ' '.join(messages)
             prompt = f"""Given this Discord support thread, extract the core question and solution.
-            Thread title: {thread.name}
-            Thread content: {thread_content}
-            
-            Please provide a clear and concise answer that explains the solution to the problem.
-            Format as:
-            Question: [clear problem statement]
-            Answer: [concise solution]"""
+
+Thread title: {thread.name}
+Thread content: {thread_content}
+
+Please provide a clear and concise answer that explains the solution to the problem.
+Format as:
+Question: [clear problem statement]
+Answer: [concise solution]"""
             
             # Get Ollama's response
             try:
                 logging.info(f"Sending request to Ollama for thread: {thread.name}")
                 ollama_url = os.getenv('OLLAMA_SERVER_URL', 'http://ollama:11434')
-                logging.info(f"Using Ollama URL: {ollama_url}")
                 
                 response = requests.post(
                     f"{ollama_url}/api/generate",
@@ -129,39 +149,82 @@ async def scrape_resolved_threads(client):
                 logging.info(f"Processed content from Ollama: {processed_content[:100]}...")
                 
                 if processed_content:
-                    thread_content = {
+                    thread_doc = {
                         "text": processed_content,
                         "source": f"Discord Thread: {thread.name}"
                     }
-                    
-                    # Add if not already present
-                    if not any(doc["source"] == thread_content["source"] for doc in documents):
-                        documents.append(thread_content)
-                        updated = True
-                        logging.info(f"Added processed thread: {thread.name}")
+                    documents.append(thread_doc)
+                    updated = True
+                    logging.info(f"Added processed thread: {thread.name}")
                     
             except requests.exceptions.RequestException as e:
                 logging.error(f"HTTP Error processing thread with Ollama: {thread.name} - {e}")
-                logging.error(f"Response content: {getattr(e.response, 'content', 'No response content')}")
                 continue
             except Exception as e:
                 logging.error(f"Error processing thread with Ollama: {thread.name} - {e}")
                 continue
                 
-        # Always update the index if we have documents, even if nothing new was added
-        if documents:
+        # Save and index if we have new documents
+        if updated:
             await save_documents(documents)
             await update_faiss_index(documents)
-            logging.info("Updated FAISS index with existing documents")
+            logging.info(f"Updated knowledge base with new thread documents")
             
         logging.info(f"Completed scraping {len(resolved_threads)} resolved threads")
         
     except Exception as e:
         logging.error(f"Error scraping resolved threads: {e}")
 
+async def run_scheduled_tasks(client):
+    """Run all scheduled tasks."""
+    try:
+        # Scrape documentation
+        if os.getenv('DOCUMENTATION_URLS'):
+            logging.info("Starting documentation scraping")
+            await scrape_documentation()
+            
+        # Scrape resolved threads
+        logging.info("Starting thread scraping")
+        await scrape_resolved_threads(client)
+        
+    except Exception as e:
+        logging.error(f"Error in scheduled tasks: {e}")
+
+async def scrape_documentation():
+    """Scrape documentation URLs and update knowledge base."""
+    try:
+        # Get documentation URLs from environment
+        doc_urls = os.getenv('DOCUMENTATION_URLS', '').split(',')
+        doc_urls = [url.strip() for url in doc_urls if url.strip()]
+        
+        if not doc_urls:
+            logging.info("No documentation URLs configured")
+            return
+            
+        documents = []
+        for url in doc_urls:
+            try:
+                logging.info(f"Processing documentation from {url}")
+                chunks = await process_documentation_url(url)
+                if chunks:
+                    documents.extend(chunks)
+                    logging.info(f"Successfully processed {len(chunks)} chunks from {url}")
+            except Exception as e:
+                logging.error(f"Error processing URL {url}: {e}")
+                continue
+                
+        if documents:
+            logging.info(f"Successfully fetched {len(documents)} documents from documentation")
+            await save_documents(documents)
+            await update_faiss_index(documents)
+            logging.info("Knowledge base updated successfully. Saved {len(documents)} documents.")
+            
+    except Exception as e:
+        logging.error(f"Error updating knowledge base: {e}")
+
 def run_scheduled_tasks(client):
     logging.info("Starting scheduled tasks")
-    schedule.every().hour.do(scrape_resolved_threads, client)
+    schedule.every().hour.do(run_scheduled_tasks, client)
     
     while True:
         schedule.run_pending()
