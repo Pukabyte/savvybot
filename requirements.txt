@@ -1,0 +1,10 @@
+discord.py
+requests
+sentence-transformers
+faiss-cpu
+beautifulsoup4
+schedule
+spacy
+python-dotenv
+aiohttp
+ratelimit
