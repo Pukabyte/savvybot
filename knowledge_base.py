@@ -9,6 +9,9 @@ import faiss
 import numpy as np
 from dotenv import load_dotenv
 import re
+from utils import load_documents, save_documents, update_faiss_index
+from sentence_transformers import SentenceTransformer
+import requests
 
 # Load environment variables
 load_dotenv()
@@ -19,6 +22,10 @@ OLLAMA_SERVER_URL = os.getenv('OLLAMA_SERVER_URL', 'http://localhost:11434')
 
 # Create a semaphore to limit concurrent requests
 REQUEST_LIMIT = 5
+
+# Initialize the sentence transformer model
+MODEL_NAME = os.getenv('MODEL_NAME', 'all-MiniLM-L6-v2')
+model = SentenceTransformer(MODEL_NAME)
 
 async def process_document(text, url, max_length=8000):
     """Process and split document into manageable chunks."""
@@ -180,107 +187,63 @@ def is_internal_link(base_url, link):
     link_domain = urlparse(link).netloc
     return not link_domain or base_domain == link_domain
 
-async def update_knowledge_base():
-    """Update the knowledge base by scraping URLs and generating embeddings."""
-    logging.info("Starting knowledge base update")
-    documents = []
-    
-    # Create semaphore for this update session
-    semaphore = asyncio.Semaphore(REQUEST_LIMIT)
-    
-    timeout = aiohttp.ClientTimeout(total=300)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        visited_urls = set()
-        
-        # Fetch all documents
-        for base_url in DOCUMENTS_URLS:
-            if not base_url:
-                continue
-            docs = await fetch_text_from_url(base_url, visited_urls, session, semaphore)
-            documents.extend(docs)
-        
-        if not documents:
-            logging.warning("No documents were fetched")
-            return
-        
-        # Generate embeddings for the documents
-        logging.info(f"Generating embeddings for {len(documents)} documents")
-        embeddings = []
-        for doc in documents:
-            embedding = await get_embedding(doc["text"], session, semaphore)
-            if embedding is not None:
-                embeddings.append(embedding)
-            else:
-                logging.error(f"Failed to get embedding for document from {doc['source']}")
-        
-        if not embeddings:
-            logging.error("No embeddings were generated")
-            return
-        
-        # Convert to numpy array and initialize FAISS index
-        embeddings_array = np.array(embeddings)
-        dimension = embeddings_array.shape[1]
-        index = faiss.IndexFlatL2(dimension)
-        index.add(embeddings_array)
-        
-        # Save the index and document data
-        os.makedirs(os.path.dirname(INDEX_PATH), exist_ok=True)
-        faiss.write_index(index, INDEX_PATH)
-        with open(DOCS_PATH, "w") as f:
-            json.dump(documents, f, indent=2)
-        logging.info(f"Knowledge base updated successfully. Saved {len(documents)} documents.")
-
-async def get_similar_documents(query, top_k=5):
-    """Search for similar documents using Ollama embeddings."""
+async def update_knowledge_base(resolved_threads=None):
+    """Update the knowledge base with both documentation and resolved threads."""
     try:
-        # Load the FAISS index and documents
-        if not os.path.exists(INDEX_PATH):
-            logging.error(f"Index file not found at {INDEX_PATH}")
+        # Fetch documentation
+        documents = await fetch_documentation()
+        
+        # Process resolved threads if provided
+        if resolved_threads:
+            for thread in resolved_threads:
+                thread_content = await process_resolved_thread(thread)
+                if thread_content:
+                    documents.append(thread_content)
+        
+        # Save all documents
+        await save_documents(documents)
+        
+        # Update the FAISS index
+        await update_faiss_index(documents)
+        
+        logging.info(f"Knowledge base updated successfully. Saved {len(documents)} documents.")
+        
+    except Exception as e:
+        logging.error(f"Error updating knowledge base: {e}")
+
+async def get_similar_documents(query, top_k=3):
+    """Get similar documents from the knowledge base."""
+    try:
+        logging.info("Loading index and documents...")
+        
+        # Load the index and documents
+        if not os.path.exists('data/knowledge_base.index'):
+            logging.error("No index file found")
             return []
             
-        if not os.path.exists(DOCS_PATH):
-            logging.error(f"Documents file not found at {DOCS_PATH}")
-            return []
-        
-        logging.info("Loading index and documents...")
-        index = faiss.read_index(INDEX_PATH)
-        with open(DOCS_PATH, 'r') as f:
-            documents = json.load(f)
-        
+        index = faiss.read_index('data/knowledge_base.index')
+        documents = await load_documents()
         logging.info(f"Loaded {len(documents)} documents")
         
         # Get query embedding
         logging.info("Getting query embedding...")
-        async with aiohttp.ClientSession() as session:
-            semaphore = asyncio.Semaphore(1)
-            query_embedding = await get_embedding(query, session, semaphore)
+        query_embedding = model.encode([query])[0]
+        query_embedding_array = np.array([query_embedding]).astype('float32')
         
-        if query_embedding is None:
-            logging.error("Failed to get query embedding")
-            return []
-        
-        # Search the index
+        # Search
         logging.info("Searching index...")
-        query_embedding_array = np.array([query_embedding])
-        D, I = index.search(query_embedding_array, top_k)
+        D, I = index.search(query_embedding_array, min(top_k, len(documents)))
         
-        # Return the matched documents
-        results = []
-        for i, (dist, idx) in enumerate(zip(D[0], I[0])):
-            if idx < len(documents):  # Ensure valid index
-                doc = documents[idx]
-                score = float(1 / (1 + dist))
-                results.append({
-                    'text': doc['text'],
-                    'source': doc['source'],
-                    'score': score
-                })
-                logging.info(f"Found match: {doc['source']} with score {score}")
+        # Get similar documents
+        similar_docs = []
+        for idx in I[0]:
+            if idx < len(documents):
+                similar_docs.append(documents[idx])
+                
+        return similar_docs
         
-        return results
-    
     except Exception as e:
-        logging.error(f"Error searching knowledge base: {str(e)}", exc_info=True)  # Add full traceback
+        logging.error(f"Error searching knowledge base: {str(e)}")
         return []
 
 async def save_documents(documents):
@@ -309,6 +272,123 @@ async def load_documents():
     except Exception as e:
         logging.error(f"Error loading documents: {e}")
         return []
+
+async def fetch_documentation():
+    """Fetch documentation from configured URLs."""
+    try:
+        urls = os.getenv('DOCUMENTS_URLS', '').split(',')
+        documents = []
+        
+        async with aiohttp.ClientSession() as session:
+            semaphore = asyncio.Semaphore(5)  # Limit concurrent requests
+            visited_urls = set()
+            
+            tasks = [fetch_text_from_url(url.strip(), visited_urls, session, semaphore) 
+                    for url in urls if url.strip()]
+            
+            if tasks:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, list):
+                        documents.extend(result)
+                    elif isinstance(result, Exception):
+                        logging.error(f"Error fetching documentation: {result}")
+            
+        logging.info(f"Successfully fetched {len(documents)} documents from documentation")
+        return documents
+        
+    except Exception as e:
+        logging.error(f"Error fetching documentation: {e}")
+        return []
+
+async def update_faiss_index(documents):
+    """Update the FAISS index with document embeddings."""
+    try:
+        # Create embeddings for all documents
+        texts = [doc['text'] for doc in documents]
+        embeddings = model.encode(texts)
+        
+        # Convert to float32 numpy array
+        embeddings = np.array(embeddings).astype('float32')
+        
+        # Create and populate FAISS index
+        dimension = embeddings.shape[1]  # Get embedding dimension
+        index = faiss.IndexFlatL2(dimension)
+        index.add(embeddings)
+        
+        # Ensure data directory exists
+        os.makedirs('data', exist_ok=True)
+        
+        # Save the index
+        faiss.write_index(index, 'data/knowledge_base.index')
+        logging.info(f"Successfully updated FAISS index with {len(documents)} documents")
+        
+    except Exception as e:
+        logging.error(f"Error updating FAISS index: {e}")
+        raise
+
+async def process_resolved_thread(thread):
+    """Process a resolved thread and extract a clear answer using Ollama."""
+    try:
+        # Get the thread title and all messages
+        thread_title = thread.name
+        messages = []
+        
+        # Fetch messages from the thread
+        async for message in thread.history(limit=None, oldest_first=True):
+            if not message.author.bot:  # Skip bot messages
+                messages.append(message.content)
+        
+        if not messages:
+            return None
+            
+        # Create prompt for Ollama
+        thread_content = ' '.join(messages)
+        prompt = f"""Given this Discord support thread, extract the core question and solution.
+        Thread title: {thread_title}
+        Thread content: {thread_content}
+        
+        Please provide a clear and concise answer that explains the solution to the problem.
+        Format as: Question: [clear problem statement]
+        Answer: [concise solution]"""
+        
+        # Get Ollama's response
+        response = await get_ollama_response(prompt)
+        
+        if not response:
+            logging.error(f"Failed to get Ollama response for thread: {thread_title}")
+            return None
+            
+        # Format the thread content
+        return {
+            "text": response,
+            "source": f"Discord Thread: {thread_title}"
+        }
+            
+    except Exception as e:
+        logging.error(f"Error processing resolved thread {thread.name}: {e}")
+        return None
+
+async def get_ollama_response(prompt):
+    """Get a response from Ollama."""
+    try:
+        response = requests.post(
+            f"{os.getenv('OLLAMA_SERVER_URL')}/api/generate",
+            json={
+                "model": os.getenv('OLLAMA_MODEL', 'llama2'),
+                "prompt": prompt,
+                "system": "You are a helpful assistant that extracts clear questions and answers from support threads. Focus on the core problem and its solution.",
+                "stream": False
+            },
+            timeout=30
+        )
+        
+        response.raise_for_status()
+        return response.json().get('response', '')
+        
+    except Exception as e:
+        logging.error(f"Error getting Ollama response: {e}")
+        return None
 
 if __name__ == "__main__":
     asyncio.run(update_knowledge_base())

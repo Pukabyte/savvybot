@@ -7,7 +7,7 @@ import numpy as np
 import requests
 from dotenv import load_dotenv
 from knowledge_base import update_knowledge_base, get_similar_documents
-from schedule_scraper import scrape_resolved_threads
+from schedule_scraper import get_resolved_threads, scrape_resolved_threads
 from sentence_transformers import SentenceTransformer
 
 # Configure logging
@@ -126,7 +126,7 @@ async def initialize_bot():
     """Initialize the bot and update knowledge base."""
     logging.info("Starting bot initialization")
     try:
-        await update_knowledge_base()
+        # Only call scrape_resolved_threads once
         await scrape_resolved_threads(client)
     except Exception as e:
         logging.error(f"Error during initialization: {e}")
@@ -188,5 +188,36 @@ async def on_message(message):
         except Exception as e:
             logging.error(f"Error processing message: {e}", exc_info=True)
             await message.channel.send("I encountered an error while processing your question.")
+
+async def process_resolved_thread(thread):
+    """Process a resolved thread and add it to the knowledge base."""
+    try:
+        # Get the thread title and all messages
+        thread_title = thread.name
+        messages = []
+        async for message in thread.history(limit=None, oldest_first=True):
+            if not message.author.bot:  # Skip bot messages
+                messages.append(message.content)
+        
+        if not messages:
+            return
+            
+        # Format the thread content
+        thread_content = {
+            "text": f"Question: {thread_title}\n\nAnswer: {' '.join(messages)}",
+            "source": f"Discord Thread: {thread_title}"
+        }
+        
+        # Load existing documents
+        documents = await load_documents()
+        
+        # Add the thread content if it's not already present
+        if not any(doc["source"] == thread_content["source"] for doc in documents):
+            documents.append(thread_content)
+            await save_documents(documents)
+            logging.info(f"Added resolved thread to knowledge base: {thread_title}")
+            
+    except Exception as e:
+        logging.error(f"Error processing resolved thread {thread.name}: {e}")
 
 client.run(DISCORD_TOKEN)
