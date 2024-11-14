@@ -7,50 +7,86 @@ import discord
 from datetime import datetime, timezone
 from utils import load_documents, save_documents, update_faiss_index
 import requests
+import asyncio
 
 load_dotenv()
 FORUM_CHANNEL_ID = int(os.getenv('FORUM_CHANNEL_ID'))
 
 async def get_resolved_threads(client):
-    """Get all threads with the resolved tag from the forum channel."""
+    """Get all threads tagged as resolved."""
     try:
-        # Check for required environment variables
-        channel_id = os.getenv('FORUM_CHANNEL_ID')
-        resolved_tag_id = os.getenv('RESOLVED_TAG_ID')
-        
-        if not channel_id or not resolved_tag_id:
-            logging.error("Missing required environment variables: FORUM_CHANNEL_ID or RESOLVED_TAG_ID")
-            return []
-            
-        channel_id = int(channel_id)
-        resolved_tag_id = int(resolved_tag_id)
-        
-        channel = client.get_channel(channel_id)
-        
-        if not channel or not isinstance(channel, discord.ForumChannel):
-            logging.error(f"Channel {channel_id} is not a forum channel")
-            return []
-            
         resolved_threads = []
+        support_channel_id = int(os.getenv('FORUM_CHANNEL_ID'))
         
-        try:
-            # Get all threads from the forum
-            active_threads = channel.threads
-            for thread in active_threads:
-                # Check if the resolved tag is applied
-                if any(tag.id == resolved_tag_id for tag in thread.applied_tags):
-                    logging.info(f"Processing tagged thread: {thread.name}")
-                    resolved_threads.append(thread)
-                    
-            # Get archived threads
-            async for thread in channel.archived_threads():
-                if any(tag.id == resolved_tag_id for tag in thread.applied_tags):
-                    logging.info(f"Processing archived tagged thread: {thread.name}")
-                    resolved_threads.append(thread)
-                    
-        except Exception as e:
-            logging.error(f"Error getting threads: {e}")
+        for guild in client.guilds:
+            logging.info(f"Checking guild: {guild.name}")
+            
+            # Get the forum channel by ID
+            forum_channel = guild.get_channel(support_channel_id)
+            if not forum_channel:
+                logging.warning(f"Could not find forum channel with ID {support_channel_id} in guild {guild.name}")
+                continue
                 
+            if not isinstance(forum_channel, discord.ForumChannel):
+                logging.warning(f"Channel {forum_channel.name} is not a forum channel (Type: {type(forum_channel)})")
+                continue
+                
+            logging.info(f"Found forum channel: {forum_channel.name}")
+            
+            # Check archived threads
+            archived_count = 0
+            async for thread in forum_channel.archived_threads(limit=None):
+                archived_count += 1
+                logging.info(f"Checking archived thread: {thread.name}")
+                if "RESOLVED" in thread.name.upper():
+                    logging.info(f"Processing archived tagged thread: {thread.name}")
+                    try:
+                        # Get the initial message
+                        messages = [msg async for msg in thread.history(limit=1, oldest_first=True)]
+                        initial_message = messages[0] if messages else None
+                        
+                        if initial_message:
+                            resolved_threads.append({
+                                'title': thread.name,
+                                'content': initial_message.content,
+                                'timestamp': thread.created_at.isoformat()
+                            })
+                            logging.info(f"Successfully processed archived thread: {thread.name}")
+                    except discord.Forbidden:
+                        logging.warning(f"No permission to read thread: {thread.name}")
+                    except Exception as e:
+                        logging.error(f"Error processing archived thread {thread.name}: {e}")
+                        continue
+            
+            logging.info(f"Checked {archived_count} archived threads")
+            
+            # Check active threads
+            active_count = 0
+            for thread in forum_channel.threads:
+                active_count += 1
+                logging.info(f"Checking active thread: {thread.name}")
+                if "RESOLVED" in thread.name.upper():
+                    logging.info(f"Processing active tagged thread: {thread.name}")
+                    try:
+                        # Get the initial message
+                        messages = [msg async for msg in thread.history(limit=1, oldest_first=True)]
+                        initial_message = messages[0] if messages else None
+                        
+                        if initial_message:
+                            resolved_threads.append({
+                                'title': thread.name,
+                                'content': initial_message.content,
+                                'timestamp': thread.created_at.isoformat()
+                            })
+                            logging.info(f"Successfully processed active thread: {thread.name}")
+                    except discord.Forbidden:
+                        logging.warning(f"No permission to read thread: {thread.name}")
+                    except Exception as e:
+                        logging.error(f"Error processing active thread {thread.name}: {e}")
+                        continue
+                        
+            logging.info(f"Checked {active_count} active threads")
+                        
         logging.info(f"Found {len(resolved_threads)} threads with resolved tag")
         return resolved_threads
         
@@ -80,100 +116,78 @@ async def process_resolved_thread(thread):
     except Exception as e:
         logging.error(f"Error processing resolved thread {thread.name}: {e}")
         return None
-
 async def scrape_resolved_threads(client):
-    """Scrape resolved threads and update knowledge base."""
+    """Scrape resolved threads and update documents."""
     try:
-        logging.info("Starting to scrape resolved threads")
+        # Load existing documents
+        documents = await load_documents() or []
+        initial_count = len(documents)
+        
+        # Get resolved threads
         resolved_threads = await get_resolved_threads(client)
-        
-        # Load existing documents or start with empty list
-        try:
-            documents = await load_documents()
-        except:
-            documents = []
+        if not resolved_threads:
+            logging.info("No resolved threads found")
+            return 0
             
-        updated = False
-        
-        # Process each thread
+        # Process new threads
+        new_thread_count = 0
         for thread in resolved_threads:
-            logging.info(f"Processing thread content for: {thread.name}")
+            thread_doc = {
+                'source': f"Thread: {thread['title']}",
+                'text': f"Question: {thread['title']}\n\nAnswer: {thread['content']}",
+                'type': 'thread',
+                'timestamp': thread.get('timestamp', datetime.now().isoformat())
+            }
             
-            # Skip if thread already exists in documents
-            if any(doc["source"] == f"Discord Thread: {thread.name}" for doc in documents):
-                logging.info(f"Thread already exists in documents: {thread.name}")
-                continue
+            # Check if thread already exists
+            if not any(doc.get('source') == thread_doc['source'] for doc in documents):
+                documents.append(thread_doc)
+                new_thread_count += 1
+                logging.info(f"Added processed thread: {thread['title']}")
                 
-            # Fetch all messages in the thread
-            messages = []
-            async for message in thread.history(limit=None, oldest_first=True):
-                if not message.author.bot:
-                    messages.append(message.content)
+        # Save if we have new threads
+        if new_thread_count > 0:
+            await save_documents(documents, append=True)
+            logging.info(f"Updated knowledge base with new thread documents")
             
-            if not messages:
-                logging.warning(f"No messages found in thread: {thread.name}")
-                continue
-                
-            # Create prompt for Ollama
-            thread_content = ' '.join(messages)
-            prompt = f"""Given this Discord support thread, extract the core question and solution.
+        logging.info(f"Completed scraping {len(resolved_threads)} resolved threads")
+        return new_thread_count
+        
+    except Exception as e:
+        logging.error(f"Error scraping resolved threads: {e}")
+        return 0
 
-Thread title: {thread.name}
+async def process_thread_with_ollama(thread_content, thread_name):
+    """Process thread content with Ollama in a separate function for better error handling."""
+    try:
+        prompt = f"""Given this Discord support thread, extract the core question and solution.
+
+Thread title: {thread_name}
 Thread content: {thread_content}
 
 Please provide a clear and concise answer that explains the solution to the problem.
 Format as:
 Question: [clear problem statement]
 Answer: [concise solution]"""
-            
-            # Get Ollama's response
-            try:
-                logging.info(f"Sending request to Ollama for thread: {thread.name}")
-                ollama_url = os.getenv('OLLAMA_SERVER_URL', 'http://ollama:11434')
-                
-                response = requests.post(
-                    f"{ollama_url}/api/generate",
-                    json={
-                        "model": os.getenv('OLLAMA_MODEL', 'llama2'),
-                        "prompt": prompt,
-                        "system": "You are a helpful assistant that extracts clear questions and answers from support threads. Focus on the core problem and its solution.",
-                        "stream": False
-                    },
-                    timeout=30
-                )
-                
-                logging.info(f"Ollama response status: {response.status_code}")
-                response.raise_for_status()
-                
-                processed_content = response.json().get('response', '')
-                logging.info(f"Processed content from Ollama: {processed_content[:100]}...")
-                
-                if processed_content:
-                    thread_doc = {
-                        "text": processed_content,
-                        "source": f"Discord Thread: {thread.name}"
-                    }
-                    documents.append(thread_doc)
-                    updated = True
-                    logging.info(f"Added processed thread: {thread.name}")
-                    
-            except requests.exceptions.RequestException as e:
-                logging.error(f"HTTP Error processing thread with Ollama: {thread.name} - {e}")
-                continue
-            except Exception as e:
-                logging.error(f"Error processing thread with Ollama: {thread.name} - {e}")
-                continue
-                
-        # Save and index if we have new documents
-        if updated:
-            await save_documents(documents)
-            await update_faiss_index(documents)
-            logging.info(f"Updated knowledge base with new thread documents")
-            
-        logging.info(f"Completed scraping {len(resolved_threads)} resolved threads")
+        
+        ollama_url = os.getenv('OLLAMA_SERVER_URL', 'http://ollama:11434')
+        response = requests.post(
+            f"{ollama_url}/api/generate",
+            json={
+                "model": os.getenv('OLLAMA_MODEL', 'llama2'),
+                "prompt": prompt,
+                "system": "You are a helpful assistant that extracts clear questions and answers from support threads. Focus on the core problem and its solution.",
+                "stream": False
+            },
+            timeout=30
+        )
+        
+        response.raise_for_status()
+        return response.json().get('response', '')
         
     except Exception as e:
-        logging.error(f"Error scraping resolved threads: {e}")
+        logging.error(f"Error processing thread with Ollama: {e}")
+        return None
 
 async def run_scheduled_tasks(client):
     """Run all scheduled tasks."""

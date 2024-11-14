@@ -127,9 +127,14 @@ async def initialize_bot():
     """Initialize the bot and update knowledge base."""
     logging.info("Starting bot initialization")
     try:
-        documents = []
+        # Load existing documents
+        documents = await load_documents() or []
+        initial_count = len(documents)
+        logging.info(f"Loaded {initial_count} existing documents")
         
-        # First scrape documentation if URLs are configured
+        updated = False
+        
+        # Scrape documentation if URLs configured
         doc_urls = os.getenv('DOCUMENTATION_URLS')
         if doc_urls:
             logging.info(f"Starting documentation scraping from URLs: {doc_urls}")
@@ -137,20 +142,24 @@ async def initialize_bot():
             if doc_urls_list:
                 doc_documents = await scrape_documentation(doc_urls_list)
                 if doc_documents:
-                    documents.extend(doc_documents)
-                    logging.info(f"Added {len(doc_documents)} documentation documents")
-        else:
-            logging.info("No documentation URLs configured, skipping documentation scraping")
-            
-        # Then scrape resolved threads
-        logging.info("Starting thread scraping")
-        await scrape_resolved_threads(client)
+                    # Append new documents
+                    documents = await save_documents(doc_documents, append=True)
+                    updated = True
+                    logging.info(f"Added documentation documents")
         
-        # Save and index all documents
-        if documents:
-            await save_documents(documents)
+        # Scrape resolved threads
+        logging.info("Starting thread scraping")
+        thread_count = await scrape_resolved_threads(client)  # Use client instead of self
+        if thread_count > 0:
+            updated = True
+            documents = await load_documents()  # Reload after thread scraping
+            
+        # Update index if we have new documents
+        if updated:
             await update_faiss_index(documents)
-            logging.info(f"Completed initialization with {len(documents)} total documents")
+            logging.info(f"Updated index with {len(documents)} documents")
+        else:
+            logging.info("No new documents to index")
             
     except Exception as e:
         logging.error(f"Error during initialization: {e}")
