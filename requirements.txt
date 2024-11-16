@@ -8,3 +8,5 @@ spacy
 python-dotenv
 aiohttp
 ratelimit
+openai
+numpy

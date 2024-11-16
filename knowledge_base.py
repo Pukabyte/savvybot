@@ -369,15 +369,25 @@ async def process_resolved_thread(thread):
         logging.error(f"Error processing resolved thread {thread.name}: {e}")
         return None
 
-async def get_ollama_response(prompt):
-    """Get a response from Ollama."""
+async def get_ollama_response(prompt, similar_documents=None):
+    """Get a response from Ollama with context from similar documents."""
     try:
+        # Prepare context from similar documents
+        context = ""
+        if similar_documents:
+            context = "\n\nRelevant context:\n" + "\n".join(
+                f"- {doc['text']}" for doc in similar_documents
+            )
+
+        # Combine prompt with context
+        full_prompt = f"{prompt}{context}"
+
         response = requests.post(
             f"{os.getenv('OLLAMA_SERVER_URL')}/api/generate",
             json={
                 "model": os.getenv('OLLAMA_MODEL', 'llama2'),
-                "prompt": prompt,
-                "system": "You are a helpful assistant that extracts clear questions and answers from support threads. Focus on the core problem and its solution.",
+                "prompt": full_prompt,
+                "system": "You are a helpful assistant that provides clear and concise answers. Use the provided context when relevant to answer questions accurately.",
                 "stream": False
             },
             timeout=30
@@ -388,7 +398,29 @@ async def get_ollama_response(prompt):
         
     except Exception as e:
         logging.error(f"Error getting Ollama response: {e}")
-        return None
+        return "I encountered an error while processing your request."
+
+async def update_knowledge_base_with_correction(original_response, correction):
+    """Update knowledge base with corrections from authorized users."""
+    try:
+        documents = await load_documents()
+        
+        # Create new document from correction
+        correction_doc = {
+            "text": f"Question: {original_response}\nCorrect Answer: {correction}",
+            "source": "User Correction",
+            "priority": 1  # Higher priority for corrections
+        }
+        
+        # Add to documents and update
+        documents.append(correction_doc)
+        await save_documents(documents)
+        await update_faiss_index(documents)
+        
+        logging.info("Knowledge base updated with correction")
+        
+    except Exception as e:
+        logging.error(f"Error updating knowledge base with correction: {e}")
 
 if __name__ == "__main__":
     asyncio.run(update_knowledge_base())

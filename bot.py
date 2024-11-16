@@ -10,14 +10,23 @@ from knowledge_base import update_knowledge_base, get_similar_documents
 from schedule_scraper import get_resolved_threads, scrape_resolved_threads, scrape_documentation, load_documents, save_documents, update_faiss_index
 from sentence_transformers import SentenceTransformer
 from documentation_scraper import scrape_documentation
+from discord.ui import Button, View
+from chat_history import ChatHistory
+from collections import defaultdict
+from discord import app_commands
+from discord.ext import commands
 
-# Configure logging
+# Suppress unnecessary warnings and info logs
+logging.getLogger('discord').setLevel(logging.ERROR)
+logging.getLogger('discord.gateway').setLevel(logging.ERROR)
+logging.getLogger('discord.client').setLevel(logging.ERROR)
+
+# Only show our application logs
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('bot.log')
+        logging.StreamHandler()
     ]
 )
 
@@ -36,23 +45,125 @@ model = SentenceTransformer(MODEL_NAME)
 
 # At the top of the file, update intents configuration
 intents = discord.Intents.all()  # Enable all intents for testing
-client = discord.Client(intents=intents)
+bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
+
+chat_history = ChatHistory()
+AUTHORIZED_CORRECTORS = set(int(id.strip()) for id in os.getenv('AUTHORIZED_CORRECTORS', '').split(',') if id.strip())
+user_history = defaultdict(list)
+response_rankings = defaultdict(lambda: {'thumbs_down': 0, 'thumbs_up': 0})
+
+TRUSTED_USER_IDS = [
+    # Add trusted user IDs here
+    123456789,  # Example ID
+]
+
+SYSTEM_PROMPT = """You are a helpful assistant for Savvyguides, Saltbox and related applications.
+Use the provided context to answer questions accurately and concisely. 
+If you're not sure about something, say so rather than making assumptions."""
+
+def is_trusted_user(interaction: discord.Interaction) -> bool:
+    return interaction.user.id in TRUSTED_USER_IDS
+
+async def fetch_url_content(url):
+    """Fetch content from a URL and return it as a document."""
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        return [{'text': response.text, 'source': url}]
+    except Exception as e:
+        logging.error(f"Error fetching URL content: {e}")
+        raise
+
+@bot.tree.command(name="add_knowledge", description="Add documents or URLs to knowledge base")
+async def add_knowledge(interaction: discord.Interaction, content: str):
+    if not is_trusted_user(interaction):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+        
+    try:
+        if content.startswith(('http://', 'https://')):
+            # Handle URL
+            documents = await fetch_url_content(content)
+        else:
+            # Handle direct text
+            documents = [{'text': content, 'source': f'Added by {interaction.user.name}'}]
+            
+        # Update knowledge base
+        current_docs = await load_documents()
+        current_docs.extend(documents)
+        await save_documents(current_docs)
+        await update_faiss_index(current_docs)
+        
+        await interaction.response.send_message("Knowledge base updated successfully!", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Error adding to knowledge base: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="forget", description="Forget chat history for current user")
+async def forget(interaction: discord.Interaction):
+    if not is_trusted_user(interaction):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+        
+    try:
+        user_id = interaction.user.id
+        if user_id in user_history:
+            del user_history[user_id]
+            await interaction.response.send_message("Chat history cleared successfully!", ephemeral=True)
+        else:
+            await interaction.response.send_message("No chat history found.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Error clearing history: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="new_chat", description="Start a new chat while preserving old context")
+async def new_chat(interaction: discord.Interaction):
+    if not is_trusted_user(interaction):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+        
+    try:
+        user_id = interaction.user.id
+        if user_id in user_history:
+            # Archive current history if needed
+            archived_history = user_history[user_id]
+            # Start fresh conversation while keeping context
+            user_history[user_id] = []
+            await interaction.response.send_message("Started new chat session!", ephemeral=True)
+        else:
+            await interaction.response.send_message("No active chat found to reset.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Error starting new chat: {str(e)}", ephemeral=True)
+
+# Add this after bot setup
+@bot.event
+async def on_ready():
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} command(s)")
+    except Exception as e:
+        print(f"Error syncing commands: {e}")
+
+    logging.info(f'Bot is ready and logged in as {bot.user.name}')
+    logging.info(f'Bot ID: {bot.user.id}')
+    logging.info('Connected to guilds: ' + ', '.join([guild.name for guild in bot.guilds]))
+    
+    # Set custom status
+    await bot.change_presence(activity=discord.Activity(
+        type=discord.ActivityType.watching, 
+        name="for your messages"
+    ))
+
+    # Initialize bot and update knowledge base
+    await initialize_bot()
 
 async def get_ollama_response(prompt, context):
     """Get a response from Ollama using the context."""
     try:
-        # Format the context to highlight different file contents
+        # Format the context string
         formatted_context = ""
-        current_file = ""
-        
-        for line in context.split('\n'):
-            # Check for code block headers in VitePress format
-            if line.startswith('```') and '[' in line and ']' in line:
-                file_name = line.split('[')[1].split(']')[0]
-                if file_name != current_file:
-                    current_file = file_name
-                    formatted_context += f"\nFile: {current_file}\n"
-            formatted_context += line + '\n'
+        if isinstance(context, list):
+            formatted_context = "\n\n".join(str(doc) for doc in context)
+        else:
+            formatted_context = str(context)
         
         system_prompt = """You are a helpful assistant for Savvyguides, Saltbox and related applications.
         Use the provided context to answer questions accurately and concisely. 
@@ -149,7 +260,7 @@ async def initialize_bot():
         
         # Scrape resolved threads
         logging.info("Starting thread scraping")
-        thread_count = await scrape_resolved_threads(client)  # Use client instead of self
+        thread_count = await scrape_resolved_threads(bot)  # Use client instead of self
         if thread_count > 0:
             updated = True
             documents = await load_documents()  # Reload after thread scraping
@@ -164,63 +275,76 @@ async def initialize_bot():
     except Exception as e:
         logging.error(f"Error during initialization: {e}")
 
-@client.event
-async def on_ready():
-    """Called when the bot is ready."""
-    logging.info(f'Logged in as {client.user}')
-    client.loop.create_task(initialize_bot())
+async def handle_message(message):
+    user_id = message.author.id
+    
+    # Get history for this specific user
+    history = user_history[user_id]
+    
+    # Add new message to history
+    history.append({
+        'role': 'user',
+        'content': message.content
+    })
+    
+    # Generate response
+    response = await generate_response(message.content, history, response_rankings)
+    
+    # Add response to history
+    history.append({
+        'role': 'assistant',
+        'content': response
+    })
+    
+    # Keep only last N messages in history
+    user_history[user_id] = history[-10:]  # Keeps last 10 messages
+    
+    # Send response and add reaction buttons
+    bot_message = await message.channel.send(response)
+    await bot_message.add_reaction("👍")
+    await bot_message.add_reaction("👎")
 
-@client.event
+@bot.event
 async def on_message(message):
-    """Handle incoming messages."""
-    # Skip own messages
-    if message.author == client.user:
+    if message.author == bot.user:
         return
-    
-    # Check if bot is mentioned or message starts with configured prefix
-    if not (client.user in message.mentions or message.content.startswith('!')):
+
+    # Handle corrections from authorized users
+    if message.reference and message.author.id in AUTHORIZED_CORRECTORS:
+        referenced_message = await message.channel.fetch_message(message.reference.message_id)
+        if referenced_message.author == bot.user:
+            chat_history.add_correction(str(referenced_message.id), message.content)
+            await message.add_reaction('✅')
+            # Update knowledge base with correction
+            await update_knowledge_base_with_correction(referenced_message.content, message.content)
+            return
+
+    # Regular message handling
+    if bot.user in message.mentions or message.content.startswith('!'):
+        content = message.content.replace(f'<@!{bot.user.id}>', '').replace(f'<@{bot.user.id}>', '').strip()
+        if message.content.startswith('!'):
+            content = content[1:].strip()
+        
+        if not content:
+            await message.channel.send("How can I help you?")
+            return
+            
+        await handle_message(message)
+
+@bot.event
+async def on_reaction_add(reaction, user):
+    if user.bot:  # Ignore bot's own reactions
         return
-        
-    # Remove the mention and clean the message content
-    content = message.content
-    if client.user in message.mentions:
-        content = content.replace(f'<@!{client.user.id}>', '').replace(f'<@{client.user.id}>', '').strip()
-    elif message.content.startswith('!'):
-        content = content[1:].strip()
-        
-    if not content:
-        await message.channel.send("How can I help you?")
-        return
-        
-    logging.info(f"Processing message from {message.author.name}: {content}")
-    
-    # Use typing context manager to show typing indicator
-    async with message.channel.typing():
-        try:
-            # Search knowledge base
-            similar_docs = await get_similar_documents(content)
             
-            if not similar_docs:
-                await message.channel.send("I couldn't find any relevant information in my knowledge base.")
-                return
-            
-            # Format response with context
-            context = "\n\n".join([f"From {doc['source']}:\n{doc['text']}" for doc in similar_docs])
-            
-            # Get Ollama response
-            response = await get_ollama_response(content, context)
-            
-            # Send response
-            if len(response) > 2000:
-                # Split long messages while maintaining typing indicator
-                for i in range(0, len(response), 2000):
-                    await message.channel.send(response[i:i+2000])
-            else:
-                await message.channel.send(response)
-                
-        except Exception as e:
-            logging.error(f"Error processing message: {e}", exc_info=True)
-            await message.channel.send("I encountered an error while processing your question.")
+    if reaction.message.author == bot.user:  # Only handle reactions to bot messages
+        if str(reaction.emoji) == "👍":
+            response_rankings[reaction.message.content]['thumbs_up'] += 1
+        elif str(reaction.emoji) == "👎":
+            response_rankings[reaction.message.content]['thumbs_down'] += 1
+            # Remove from user's history
+            user_history[user.id] = [msg for msg in user_history[user.id] 
+                                   if msg['content'] != reaction.message.content]
+            await update_knowledge_base_with_correction(reaction.message.content, "")
 
 async def process_resolved_thread(thread):
     """Process a resolved thread and add it to the knowledge base."""
@@ -253,44 +377,126 @@ async def process_resolved_thread(thread):
     except Exception as e:
         logging.error(f"Error processing resolved thread {thread.name}: {e}")
 
-async def handle_message(message):
-    """Handle incoming messages."""
+async def update_knowledge_base_with_correction(original_response, correction):
+    """Update knowledge base with corrected information."""
     try:
-        question = message.content
-        logging.info(f"Processing message from {message.author.name}: {question}")
-        
-        # Search for similar content
-        similar_docs = await get_similar_documents(question, top_k=1)
-        similar_content = similar_docs[0]['text'] if similar_docs else None
-        
-        # Create prompt for Ollama
-        prompt = f"""Based on this question and any related previous answer, provide a clear, direct response.
+        documents = await load_documents()
+        documents.append({
+            "text": f"Incorrect: {original_response}\nCorrection: {correction}",
+            "source": "User Corrections"
+        })
+        await save_documents(documents)
+        await update_faiss_index(documents)
+    except Exception as e:
+        logging.error(f"Error updating knowledge base with correction: {e}")
 
-Question: {question}
+async def get_embedding(text):
+    """Convert text to embedding using the sentence transformer model."""
+    try:
+        return model.encode([text])[0]
+    except Exception as e:
+        logging.error(f"Error generating embedding: {e}")
+        return None
 
-{"Previous relevant information:" + similar_content if similar_content else ""}
+async def load_faiss_index():
+    """Load the FAISS index from disk."""
+    try:
+        if os.path.exists(INDEX_PATH):
+            return faiss.read_index(INDEX_PATH)
+        return None
+    except Exception as e:
+        logging.error(f"Error loading FAISS index: {e}")
+        return None
 
-Respond directly to the question. Do not reference previous discussions or mention that this has been asked before. Provide a clear, actionable answer."""
+async def get_similar_responses(query, top_k=5):
+    try:
+        documents = await load_documents()
+        if not documents:
+            return []
+            
+        # Convert query to embedding
+        query_embedding = await get_embedding(query)
         
-        # Get Ollama's response
+        # Search for similar responses
+        faiss_index = await load_faiss_index()
+        if not faiss_index:
+            return []
+            
+        D, I = faiss_index.search(np.array([query_embedding]), top_k)
+        
+        # Get the similar responses
+        similar_responses = [
+            {'text': documents[i]['text'], 'source': documents[i]['source']}
+            for i in I[0] if i < len(documents)
+        ]
+        
+        return similar_responses
+        
+    except Exception as e:
+        logging.error(f"Error getting similar responses: {e}")
+        return []
+
+async def generate_response(message, history, rankings=None):
+    try:
+        # Get similar responses from knowledge base
+        similar_responses = await get_similar_responses(message)
+        
+        # Sort responses by ranking score if rankings exist
+        if rankings and similar_responses:
+            for response in similar_responses:
+                rank_data = rankings.get(response['text'], {'thumbs_up': 0, 'thumbs_down': 0})
+                total = rank_data['thumbs_up'] + rank_data['thumbs_down'] + 1
+                response['score'] = (rank_data['thumbs_up'] - rank_data['thumbs_down']) / total
+            
+            similar_responses.sort(key=lambda x: x.get('score', 0), reverse=True)
+        
+        # Add context from similar responses
+        context = ""
+        if similar_responses:
+            context = "Previous relevant responses:\n" + "\n".join(
+                f"[Score: {r.get('score', 0):.2f}] {r['text']}" 
+                for r in similar_responses[:3]
+            )
+
+        # Format the full prompt
+        full_prompt = f"{context}\n\nQuestion: {message}"
+        
+        # Get response from Ollama
         response = requests.post(
-            f"{os.getenv('OLLAMA_SERVER_URL')}/api/generate",
+            f"{OLLAMA_SERVER_URL}/api/generate",
             json={
-                "model": os.getenv('OLLAMA_MODEL', 'llama2'),
-                "prompt": prompt,
-                "system": "You are a helpful support assistant. Provide clear, direct answers without referencing previous discussions or mentioning that the question has been asked before.",
+                "model": OLLAMA_MODEL,
+                "prompt": full_prompt,
+                "system": SYSTEM_PROMPT,
                 "stream": False
             },
             timeout=30
         )
         
         response.raise_for_status()
-        answer = response.json().get('response', '')
+        response_text = response.json()['response']
         
-        await message.channel.send(answer)
+        # Split response if it's too long
+        if len(response_text) > 1900:  # Leave room for formatting
+            return response_text[:1900] + "\n... (response truncated)"
+            
+        return response_text
         
     except Exception as e:
-        logging.error(f"Error processing message: {e}")
-        await message.channel.send("I encountered an error while processing your question.")
+        logging.error(f"Error generating response: {e}")
+        return "I encountered an error while processing your request."
 
-client.run(DISCORD_TOKEN)
+@bot.event
+async def on_disconnect():
+    logging.warning("Bot disconnected from Discord - attempting to reconnect...")
+
+@bot.event
+async def on_connect():
+    logging.info("Bot reconnected to Discord successfully")
+
+@bot.event
+async def on_resumed():
+    logging.info("Bot session resumed")
+
+# Update the bot.run() call at the bottom of the file
+bot.run(DISCORD_TOKEN, reconnect=True)
