@@ -1,6 +1,2 @@
 .env
-data/documents.json
-data/knowledge_base.index
-data/index_metadata.json
-data/chat_history.json
-data/knowledge_base_metadata.json
+data/

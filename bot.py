@@ -11,7 +11,6 @@ from schedule_scraper import get_resolved_threads, scrape_resolved_threads, scra
 from sentence_transformers import SentenceTransformer
 from documentation_scraper import scrape_documentation
 from discord.ui import Button, View
-from chat_history import ChatHistory
 from collections import defaultdict
 from discord import app_commands
 from discord.ext import commands
@@ -47,22 +46,18 @@ model = SentenceTransformer(MODEL_NAME)
 intents = discord.Intents.all()  # Enable all intents for testing
 bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
 
-chat_history = ChatHistory()
-AUTHORIZED_CORRECTORS = set(int(id.strip()) for id in os.getenv('AUTHORIZED_CORRECTORS', '').split(',') if id.strip())
 user_history = defaultdict(list)
 response_rankings = defaultdict(lambda: {'thumbs_down': 0, 'thumbs_up': 0})
-
-TRUSTED_USER_IDS = [
-    # Add trusted user IDs here
-    123456789,  # Example ID
-]
+TRUSTED_USER_IDS = set(int(id.strip()) for id in os.getenv('TRUSTED_USER_IDS', '').split(',') if id.strip())
+AUTHORIZED_CORRECTORS = TRUSTED_USER_IDS  # Use same trusted users for corrections
 
 SYSTEM_PROMPT = """You are a helpful assistant for Savvyguides, Saltbox and related applications.
 Use the provided context to answer questions accurately and concisely. 
 If you're not sure about something, say so rather than making assumptions."""
 
 def is_trusted_user(interaction: discord.Interaction) -> bool:
-    return interaction.user.id in TRUSTED_USER_IDS
+    """Check if user is trusted based on their ID."""
+    return str(interaction.user.id) in TRUSTED_USER_IDS or interaction.user.id in TRUSTED_USER_IDS
 
 async def fetch_url_content(url):
     """Fetch content from a URL and return it as a document."""
@@ -297,10 +292,10 @@ async def handle_message(message):
     })
     
     # Keep only last N messages in history
-    user_history[user_id] = history[-10:]  # Keeps last 10 messages
+    user_history[user_id] = history[-10:]
     
-    # Send response and add reaction buttons
-    bot_message = await message.channel.send(response)
+    # Use send_long_message instead of direct send
+    bot_message = await send_long_message(message.channel, response)
     await bot_message.add_reaction("👍")
     await bot_message.add_reaction("👎")
 
@@ -313,7 +308,6 @@ async def on_message(message):
     if message.reference and message.author.id in AUTHORIZED_CORRECTORS:
         referenced_message = await message.channel.fetch_message(message.reference.message_id)
         if referenced_message.author == bot.user:
-            chat_history.add_correction(str(referenced_message.id), message.content)
             await message.add_reaction('✅')
             # Update knowledge base with correction
             await update_knowledge_base_with_correction(referenced_message.content, message.content)
@@ -333,18 +327,48 @@ async def on_message(message):
 
 @bot.event
 async def on_reaction_add(reaction, user):
-    if user.bot:  # Ignore bot's own reactions
+    if user.bot or reaction.message.author != bot.user:
         return
             
-    if reaction.message.author == bot.user:  # Only handle reactions to bot messages
-        if str(reaction.emoji) == "👍":
-            response_rankings[reaction.message.content]['thumbs_up'] += 1
-        elif str(reaction.emoji) == "👎":
-            response_rankings[reaction.message.content]['thumbs_down'] += 1
-            # Remove from user's history
-            user_history[user.id] = [msg for msg in user_history[user.id] 
-                                   if msg['content'] != reaction.message.content]
-            await update_knowledge_base_with_correction(reaction.message.content, "")
+    message_content = reaction.message.content
+    
+    # Initialize rating if not exists
+    if message_content not in response_rankings:
+        response_rankings[message_content] = {'thumbs_up': 0, 'thumbs_down': 0}
+    
+    if str(reaction.emoji) == "👍":
+        # Increment thumbs up counter
+        response_rankings[message_content]['thumbs_up'] += 1
+        
+        # Save positive response with rating
+        await save_documents([{
+            'text': message_content,
+            'source': 'Positively rated response',
+            'rating': {
+                'thumbs_up': response_rankings[message_content]['thumbs_up'],
+                'thumbs_down': response_rankings[message_content]['thumbs_down']
+            }
+        }], append=True)
+        
+    elif str(reaction.emoji) == "👎":
+        # Increment thumbs down counter
+        response_rankings[message_content]['thumbs_down'] += 1
+        
+        # Save negative response with rating
+        await save_documents([{
+            'text': f"Incorrect: {message_content}\nCorrection: Response marked as incorrect by user",
+            'source': 'User Corrections',
+            'rating': {
+                'thumbs_up': response_rankings[message_content]['thumbs_up'], 
+                'thumbs_down': response_rankings[message_content]['thumbs_down']
+            }
+        }], append=True)
+        
+        # Remove from user history
+        user_id = user.id
+        if user_id in user_history:
+            user_history[user_id] = [msg for msg in user_history[user_id] 
+                                   if msg['content'] != message_content]
 
 async def process_resolved_thread(thread):
     """Process a resolved thread and add it to the knowledge base."""
@@ -461,26 +485,19 @@ async def generate_response(message, history, rankings=None):
         # Format the full prompt
         full_prompt = f"{context}\n\nQuestion: {message}"
         
-        # Get response from Ollama
         response = requests.post(
             f"{OLLAMA_SERVER_URL}/api/generate",
             json={
                 "model": OLLAMA_MODEL,
                 "prompt": full_prompt,
-                "system": SYSTEM_PROMPT,
+                "system": SYSTEM_PROMPT + "\nOnly use information from the provided context. Do not make assumptions or add information not present in the context.",
                 "stream": False
             },
-            timeout=30
+            timeout=60
         )
         
         response.raise_for_status()
-        response_text = response.json()['response']
-        
-        # Split response if it's too long
-        if len(response_text) > 1900:  # Leave room for formatting
-            return response_text[:1900] + "\n... (response truncated)"
-            
-        return response_text
+        return response.json()['response']
         
     except Exception as e:
         logging.error(f"Error generating response: {e}")
@@ -497,6 +514,57 @@ async def on_connect():
 @bot.event
 async def on_resumed():
     logging.info("Bot session resumed")
+
+# Add pagination for large responses
+async def send_long_message(channel, content):
+    """Send a long message, splitting it at appropriate breakpoints."""
+    MAX_LENGTH = 1900  # Discord's limit minus some buffer for formatting
+    
+    if len(content) <= MAX_LENGTH:
+        return await channel.send(content)
+    
+    messages = []
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    
+    # Split on paragraphs first
+    paragraphs = content.split('\n\n')
+    
+    for paragraph in paragraphs:
+        if current_length + len(paragraph) + 2 <= MAX_LENGTH:  # +2 for newlines
+            current_chunk.append(paragraph)
+            current_length += len(paragraph) + 2
+        else:
+            if current_chunk:
+                chunks.append('\n\n'.join(current_chunk))
+            current_chunk = [paragraph]
+            current_length = len(paragraph)
+    
+    if current_chunk:
+        chunks.append('\n\n'.join(current_chunk))
+    
+    # Send chunks without numbering
+    for chunk in chunks:
+        msg = await channel.send(chunk)
+        messages.append(msg)
+    
+    return messages[-1]  # Return last message for reactions
+
+# Add document chunking
+async def process_document(content, source):
+    MAX_CHUNK_SIZE = 500  # words
+    chunks = []
+    words = content.split()
+    
+    for i in range(0, len(words), MAX_CHUNK_SIZE):
+        chunk = ' '.join(words[i:i + MAX_CHUNK_SIZE])
+        chunks.append({
+            'text': chunk,
+            'source': f"{source} (part {len(chunks) + 1})"
+        })
+    
+    return chunks
 
 # Update the bot.run() call at the bottom of the file
 bot.run(DISCORD_TOKEN, reconnect=True)
